@@ -1,0 +1,179 @@
+use anchor_lang::prelude::*;
+use serum_dex::state::{Market, MarketState};
+use solana_program::program::invoke_signed;
+use solana_program::pubkey::Pubkey;
+use solana_program::sysvar::clock::Clock;
+use solana_program::account_info::AccountInfo;
+use anchor_lang::solana_program::system_instruction;
+
+declare_id!("YourProgramID");
+
+#[program]
+pub mod arbitrage {
+    use super::*;
+
+    // Основная функция арбитража
+    pub fn perform_arbitrage(ctx: Context<PerformArbitrage>, amount: u64) -> ProgramResult {
+        // Получаем настройки арбитража из аккаунта
+        let settings = &ctx.accounts.settings;
+        let min_price = settings.min_price;
+        let max_price = settings.max_price;
+        let slippage = settings.slippage;
+        let fee = settings.fee;
+
+        // Получаем рыночные цены с двух DEX (через оракулы)
+        let price_a = get_oracle_price(&ctx.accounts.market_a)?;
+        let price_b = get_oracle_price(&ctx.accounts.market_b)?;
+
+        msg!("Price on Market A: {}", price_a);
+        msg!("Price on Market B: {}", price_b);
+
+        // Проверяем, что цены находятся в пределах допустимого диапазона
+        if price_a < min_price || price_a > max_price || price_b < min_price || price_b > max_price {
+            return Err(ProgramError::InvalidArgument); // Цена не в пределах допустимого диапазона
+        }
+
+        // Проверка проскальзывания
+        let adjusted_price_a = get_price_with_slippage(price_a, slippage);
+        let adjusted_price_b = get_price_with_slippage(price_b, slippage);
+
+        msg!("Adjusted Price on Market A: {}", adjusted_price_a);
+        msg!("Adjusted Price on Market B: {}", adjusted_price_b);
+
+        // Логика арбитража: если цена на одном рынке выше, чем на другом, покупаем на другом и продаем на текущем
+        if adjusted_price_a > adjusted_price_b {
+            // Проверяем ликвидность на обоих рынках
+            if !check_liquidity(&ctx.accounts.market_b, amount)? || !check_liquidity(&ctx.accounts.market_a, amount)? {
+                return Err(ProgramError::InsufficientFunds); // Недостаточно ликвидности
+            }
+            // Покупаем на Market B и продаем на Market A
+            execute_trade(&ctx.accounts.user, &ctx.accounts.market_b, &ctx.accounts.market_a, amount, fee)?;
+        } else if adjusted_price_b > adjusted_price_a {
+            // Проверяем ликвидность
+            if !check_liquidity(&ctx.accounts.market_a, amount)? || !check_liquidity(&ctx.accounts.market_b, amount)? {
+                return Err(ProgramError::InsufficientFunds); // Недостаточно ликвидности
+            }
+            // Покупаем на Market A и продаем на Market B
+            execute_trade(&ctx.accounts.user, &ctx.accounts.market_a, &ctx.accounts.market_b, amount, fee)?;
+        }
+
+        Ok(())
+    }
+
+    // Получение цены с оракула (например, Chainlink)
+    fn get_oracle_price(market: &AccountInfo) -> Result<f64, ProgramError> {
+        // В реальной реализации будет запрос к оракулу
+        // Например, с помощью Chainlink или других решений для получения актуальной цены
+        Ok(1.0) // Замените на реальное получение цены через оракул
+    }
+
+    // Получение рыночной цены с учётом проскальзывания
+    fn get_price_with_slippage(price: f64, slippage: f64) -> f64 {
+        let min_price = price * (1.0 - slippage);
+        let max_price = price * (1.0 + slippage);
+        if price < min_price || price > max_price {
+            return price; // Если цена выходит за пределы, возвращаем её как есть
+        }
+        price
+    }
+
+    // Проверка ликвидности на рынке
+    fn check_liquidity(market: &AccountInfo, amount: u64) -> Result<bool, ProgramError> {
+        // В реальной реализации можно сделать запросы к рынку для получения данных о ликвидности
+        Ok(true) // Замените на реальную проверку
+    }
+
+    // Расчёт прибыли после учёта комиссии
+    fn calculate_trade_profit(amount: u64, price: f64, fee: f64) -> f64 {
+        let total_cost = amount as f64 * price;
+        let total_fee = total_cost * fee;
+        total_cost - total_fee
+    }
+
+    // Выполнение сделки (покупка и продажа)
+    fn execute_trade(user: &Signer, from_market: &AccountInfo, to_market: &AccountInfo, amount: u64, fee: f64) -> ProgramResult {
+        let price = get_oracle_price(from_market)?;
+
+        // Расчёт прибыли
+        let profit = calculate_trade_profit(amount, price, fee);
+        if profit <= 0.0 {
+            return Err(ProgramError::InsufficientFunds); // Если прибыль не положительная
+        }
+
+        // Логика для создания ордера на покупку и продажу
+        // Используйте вызовы к DEX, например, Serum, для создания ордера
+        let ix = serum_dex::instruction::new_order(
+            &user.key(),
+            from_market.key,
+            to_market.key,
+            amount,
+            serum_dex::matching::Side::Bid, // Или Ask в зависимости от операции
+            serum_dex::matching::PriceType::Limit,
+            price as u64,
+            10_000,    // Примерная ликвидность
+        );
+
+        invoke_signed(&ix, &[from_market.clone(), to_market.clone(), user.clone()], &[])?;
+
+        Ok(())
+    }
+
+    // Обновление настроек арбитража (для динамического управления)
+    pub fn update_settings(ctx: Context<UpdateSettings>, min_price: f64, max_price: f64, slippage: f64, fee: f64) -> ProgramResult {
+        let settings = &mut ctx.accounts.settings;
+        settings.min_price = min_price;
+        settings.max_price = max_price;
+        settings.slippage = slippage;
+        settings.fee = fee;
+        Ok(())
+    }
+
+    // Возврат статуса ордера
+    pub fn get_trade_status(ctx: Context<GetTradeStatus>) -> ProgramResult {
+        let status = &ctx.accounts.order_history.status;
+        msg!("Current Trade Status: {:?}", status);
+        Ok(())
+    }
+}
+
+// Структуры аккаунтов для работы с контрактом
+
+#[derive(Accounts)]
+pub struct PerformArbitrage<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>, // Подписант, который выполняет арбитраж
+    pub market_a: AccountInfo<'info>, // DEX A
+    pub market_b: AccountInfo<'info>, // DEX B
+    pub settings: Account<'info, ArbitrageSettings>, // Настройки арбитража
+    pub token_program: Program<'info, Token>, // Программа для работы с токенами
+    pub order_history: Account<'info, OrderHistory>, // Хранение истории ордеров
+}
+
+// Структура для хранения настроек арбитража
+#[account]
+pub struct ArbitrageSettings {
+    pub min_price: f64,
+    pub max_price: f64,
+    pub slippage: f64,
+    pub fee: f64,
+}
+
+// Структура для хранения статуса ордера
+#[account]
+pub struct OrderHistory {
+    pub status: String, // Статус ордера (например, Pending, Executed, Failed)
+}
+
+// Структура для обновления настроек арбитража
+#[derive(Accounts)]
+pub struct UpdateSettings<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>, // Пользователь, который обновляет настройки
+    pub settings: Account<'info, ArbitrageSettings>, // Настройки арбитража
+}
+
+// Структура для получения статуса ордера
+#[derive(Accounts)]
+pub struct GetTradeStatus<'info> {
+    pub order_history: Account<'info, OrderHistory>, // Хранение статуса ордера
+}
